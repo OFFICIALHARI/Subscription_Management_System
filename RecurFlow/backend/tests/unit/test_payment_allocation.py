@@ -1,6 +1,7 @@
 """Unit tests for payment allocation financial invariants, balance tracking, and over-allocation prevention."""
 
 from decimal import Decimal
+
 import pytest
 
 from app.services.payment_allocation_service import (

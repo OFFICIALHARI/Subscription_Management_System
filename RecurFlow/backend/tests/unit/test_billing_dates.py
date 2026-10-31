@@ -1,7 +1,6 @@
 """Unit tests for centralized billing date calculation and calendar boundary rules."""
 
-from datetime import date, datetime, timezone
-import pytest
+from datetime import UTC, date, datetime
 
 from app.services.billing_date_service import billing_date_service
 
@@ -129,5 +128,5 @@ def test_billing_period_semi_open_interval() -> None:
 
 def test_utc_consistency() -> None:
     """Scenario 15: UTC instant boundary handling."""
-    utc_now = datetime.now(timezone.utc)
-    assert utc_now.tzinfo == timezone.utc
+    utc_now = datetime.now(UTC)
+    assert utc_now.tzinfo == UTC

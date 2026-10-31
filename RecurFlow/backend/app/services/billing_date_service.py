@@ -1,7 +1,7 @@
 """Centralized billing cycle and date arithmetic service for RecurFlow."""
 
 import calendar
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Literal
 
 BillingIntervalType = Literal["DAILY", "WEEKLY", "MONTHLY", "YEARLY"]
