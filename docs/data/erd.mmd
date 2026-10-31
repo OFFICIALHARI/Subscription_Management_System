@@ -1,0 +1,320 @@
+erDiagram
+    users {
+        bigint id PK
+        varchar email UK
+        varchar hashed_password
+        varchar role
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    customers {
+        bigint id PK
+        bigint user_id FK
+        varchar company_name
+        varchar contact_name
+        varchar email
+        varchar phone
+        varchar tax_identifier
+        varchar billing_address_line1
+        varchar billing_city
+        varchar billing_state
+        varchar billing_postal_code
+        varchar billing_country
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    audit_logs {
+        bigint id PK
+        bigint actor_user_id FK
+        varchar action
+        varchar entity_type
+        bigint entity_id
+        varchar ip_address
+        jsonb metadata
+        timestamp created_at
+    }
+
+    products {
+        bigint id PK
+        varchar name
+        varchar product_type
+        varchar sku UK
+        text description
+        numeric sales_price
+        numeric cost_price
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    product_variants {
+        bigint id PK
+        bigint product_id FK
+        varchar variant_name
+        varchar variant_value
+        varchar sku_suffix
+        numeric price_adjustment
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    tax_rates {
+        bigint id PK
+        varchar name
+        numeric rate_percentage
+        varchar tax_type
+        varchar description
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    plans {
+        bigint id PK
+        varchar name
+        varchar code UK
+        text description
+        varchar billing_interval
+        integer interval_count
+        integer trial_period_days
+        integer minimum_quantity
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    plan_items {
+        bigint id PK
+        bigint plan_id FK
+        bigint product_id FK
+        bigint product_variant_id FK
+        integer quantity
+        numeric unit_price
+        timestamp created_at
+    }
+
+    quotation_templates {
+        bigint id PK
+        varchar name
+        text description
+        integer default_validity_days
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    quotations {
+        bigint id PK
+        varchar quotation_number UK
+        bigint customer_id FK
+        bigint template_id FK
+        varchar status
+        date issue_date
+        date expiration_date
+        varchar currency
+        numeric subtotal
+        numeric discount_amount
+        numeric tax_amount
+        numeric total_amount
+        boolean is_converted
+        text notes
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    quotation_lines {
+        bigint id PK
+        bigint quotation_id FK
+        bigint product_id FK
+        bigint product_variant_id FK
+        bigint plan_id FK
+        varchar description_snapshot
+        integer quantity
+        numeric unit_price_snapshot
+        numeric discount_rate
+        bigint tax_rate_id FK
+        numeric tax_rate_snapshot
+        numeric line_subtotal
+        numeric line_tax
+        numeric line_total
+        timestamp created_at
+    }
+
+    subscriptions {
+        bigint id PK
+        varchar subscription_number UK
+        bigint customer_id FK
+        bigint plan_id FK
+        bigint originating_quotation_id FK
+        varchar status
+        date start_date
+        date end_date
+        integer billing_anchor_day
+        date next_billing_date
+        integer payment_terms_days
+        varchar currency
+        numeric recurring_amount
+        varchar auto_close_reason
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    subscription_lines {
+        bigint id PK
+        bigint subscription_id FK
+        bigint product_id FK
+        bigint product_variant_id FK
+        varchar description_snapshot
+        integer quantity
+        numeric unit_price_snapshot
+        bigint tax_rate_id FK
+        numeric tax_rate_snapshot
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    subscription_events {
+        bigint id PK
+        bigint subscription_id FK
+        varchar event_type
+        bigint actor_user_id FK
+        varchar from_status
+        varchar to_status
+        varchar reason
+        timestamp created_at
+    }
+
+    discounts {
+        bigint id PK
+        varchar code UK
+        varchar name
+        varchar discount_type
+        numeric discount_value
+        numeric min_order_amount
+        integer max_uses_total
+        integer uses_count
+        integer max_uses_per_customer
+        date start_date
+        date end_date
+        boolean is_active
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    discount_applications {
+        bigint id PK
+        bigint discount_id FK
+        bigint customer_id FK
+        bigint invoice_id FK
+        numeric applied_amount
+        timestamp created_at
+    }
+
+    invoices {
+        bigint id PK
+        varchar invoice_number UK
+        bigint customer_id FK
+        bigint subscription_id FK
+        date billing_period_start
+        date billing_period_end
+        date issue_date
+        date due_date
+        varchar status
+        varchar currency
+        numeric subtotal
+        numeric discount_amount
+        numeric tax_amount
+        numeric total_amount
+        numeric amount_paid
+        numeric balance_due
+        timestamp pdf_generated_at
+        text notes
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    invoice_lines {
+        bigint id PK
+        bigint invoice_id FK
+        bigint subscription_line_id FK
+        varchar description_snapshot
+        integer quantity
+        numeric unit_price_snapshot
+        numeric discount_amount
+        numeric tax_rate_snapshot
+        numeric line_subtotal
+        numeric line_tax
+        numeric line_total
+        timestamp created_at
+    }
+
+    payments {
+        bigint id PK
+        varchar payment_number UK
+        bigint customer_id FK
+        varchar payment_method
+        numeric amount
+        varchar currency
+        date paid_at
+        varchar transaction_reference
+        text notes
+        varchar status
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    payment_allocations {
+        bigint id PK
+        bigint payment_id FK
+        bigint invoice_id FK
+        numeric allocated_amount
+        timestamp allocated_at
+    }
+
+    %% Entity Relationships
+    users ||--o| customers : "provisions portal for"
+    users ||--o{ audit_logs : "records actions in"
+    users ||--o{ subscription_events : "triggers"
+
+    customers ||--o{ quotations : "receives"
+    customers ||--o{ subscriptions : "contracts"
+    customers ||--o{ invoices : "billed via"
+    customers ||--o{ payments : "submits"
+    customers ||--o{ discount_applications : "claims"
+
+    products ||--o{ product_variants : "provides"
+    products ||--o{ plan_items : "referenced in"
+    products ||--o{ quotation_lines : "quoted in"
+    products ||--o{ subscription_lines : "committed in"
+
+    product_variants ||--o{ plan_items : "configures"
+    product_variants ||--o{ quotation_lines : "selected in"
+    product_variants ||--o{ subscription_lines : "selected in"
+
+    tax_rates ||--o{ quotation_lines : "applied to"
+    tax_rates ||--o{ subscription_lines : "configured in"
+
+    plans ||--o{ plan_items : "bundles"
+    plans ||--o{ subscriptions : "governs cadence of"
+    plans ||--o{ quotation_lines : "packaged in"
+
+    quotation_templates ||--o{ quotations : "templates"
+    quotations ||--|{ quotation_lines : "contains"
+    quotations ||--o| subscriptions : "converts into"
+
+    subscriptions ||--|{ subscription_lines : "defines"
+    subscriptions ||--o{ subscription_events : "transitions through"
+    subscriptions ||--o{ invoices : "recurringly generates"
+
+    subscription_lines ||--o{ invoice_lines : "manifests as"
+    invoices ||--|{ invoice_lines : "contains"
+    invoices ||--o{ discount_applications : "reduced by"
+    invoices ||--o{ payment_allocations : "settled through"
+
+    discounts ||--o{ discount_applications : "governs"
+    payments ||--|{ payment_allocations : "apportioned by"
