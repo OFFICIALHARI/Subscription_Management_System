@@ -1,4 +1,4 @@
-"""Invoice and InvoiceLine Pydantic v2 schemas."""
+"""Invoice Pydantic v2 schemas aligned with invoices and invoice_lines."""
 
 from datetime import date, datetime
 from decimal import Decimal
@@ -7,28 +7,25 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class InvoiceLineResponse(BaseModel):
-    """Invoice line item representation (matches InvoiceLine ORM model)."""
+    """Invoice line item representation matching invoice_lines."""
 
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     invoice_id: int
-    product_id: int
-    product_variant_id: int | None = None
     subscription_line_id: int | None = None
     description_snapshot: str
     quantity: int
     unit_price_snapshot: Decimal
-    tax_rate_id: int | None = None
+    discount_amount: Decimal
     tax_rate_snapshot: Decimal
     line_subtotal: Decimal
-    line_discount_amount: Decimal
-    line_tax_amount: Decimal
+    line_tax: Decimal
     line_total: Decimal
 
 
 class InvoiceResponse(BaseModel):
-    """Invoice summary representation (matches Invoice ORM model)."""
+    """Invoice summary representation matching invoices."""
 
     model_config = ConfigDict(from_attributes=True)
 

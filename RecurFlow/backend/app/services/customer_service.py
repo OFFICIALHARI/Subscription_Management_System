@@ -70,48 +70,49 @@ class CustomerService:
         total_invoiced = float(invoices_agg[0]) if invoices_agg else 0.0
         outstanding = float(invoices_agg[1]) if invoices_agg else 0.0
 
-        detail_dict = {
-            "id": customer.id,
-            "user_id": customer.user_id,
-            "company_name": customer.company_name,
-            "contact_name": customer.contact_name,
-            "email": customer.email,
-            "phone": customer.phone,
-            "tax_identifier": customer.tax_identifier,
-            "billing_address_line1": customer.billing_address_line1,
-            "billing_address_line2": customer.billing_address_line2,
-            "city": customer.city,
-            "state": customer.state,
-            "postal_code": customer.postal_code,
-            "country": customer.country,
-            "currency": customer.currency,
-            "payment_terms_days": customer.payment_terms_days,
-            "is_active": customer.is_active,
-            "created_at": customer.created_at,
-            "updated_at": customer.updated_at,
-            "active_subscriptions_count": active_subs,
-            "total_invoiced_amount": total_invoiced,
-            "outstanding_balance": outstanding,
-        }
-        return CustomerDetailResponse(**detail_dict)
+        return CustomerDetailResponse(
+            id=customer.id,
+            user_id=customer.user_id,
+            company_name=customer.company_name,
+            contact_name=customer.contact_name,
+            email=customer.email,
+            phone=customer.phone,
+            tax_identifier=customer.tax_identifier,
+            billing_address_line1=customer.billing_address_line1,
+            billing_address_line2=customer.billing_address_line2,
+            billing_city=customer.billing_city,
+            billing_state=customer.billing_state,
+            billing_postal_code=customer.billing_postal_code,
+            billing_country=customer.billing_country,
+            is_active=customer.is_active,
+            created_at=customer.created_at,
+            updated_at=customer.updated_at,
+            active_subscriptions_count=active_subs,
+            total_invoiced_amount=total_invoiced,
+            outstanding_balance=outstanding,
+        )
 
     def create_customer(self, db: Session, customer_in: CustomerCreate) -> Customer:
         """Create a new customer."""
+        existing = db.query(Customer).filter(Customer.email == str(customer_in.email).lower()).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"A customer with email '{customer_in.email}' already exists.",
+            )
         customer = Customer(
             user_id=customer_in.user_id,
             company_name=customer_in.company_name,
             contact_name=customer_in.contact_name,
-            email=customer_in.email,
+            email=str(customer_in.email).lower(),
             phone=customer_in.phone,
             tax_identifier=customer_in.tax_identifier,
             billing_address_line1=customer_in.billing_address_line1,
             billing_address_line2=customer_in.billing_address_line2,
-            city=customer_in.city,
-            state=customer_in.state,
-            postal_code=customer_in.postal_code,
-            country=customer_in.country,
-            currency=customer_in.currency,
-            payment_terms_days=customer_in.payment_terms_days,
+            billing_city=customer_in.billing_city,
+            billing_state=customer_in.billing_state,
+            billing_postal_code=customer_in.billing_postal_code,
+            billing_country=customer_in.billing_country,
             is_active=True,
         )
         db.add(customer)
@@ -125,6 +126,18 @@ class CustomerService:
         """Update customer details."""
         customer = self.get_customer(db, customer_id)
         update_data = customer_in.model_dump(exclude_unset=True)
+        if "email" in update_data and update_data["email"] is not None:
+            update_data["email"] = str(update_data["email"]).lower()
+            clash = (
+                db.query(Customer)
+                .filter(Customer.email == update_data["email"], Customer.id != customer_id)
+                .first()
+            )
+            if clash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"A customer with email '{update_data['email']}' already exists.",
+                )
         for field, value in update_data.items():
             setattr(customer, field, value)
         db.commit()

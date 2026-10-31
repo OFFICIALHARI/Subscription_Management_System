@@ -11,6 +11,7 @@ from app.models.invoice import Invoice
 from app.models.payment import Payment, PaymentAllocation
 from app.schemas.payment import PaymentCreate
 from app.services.payment_allocation_service import (
+    AllocationError,
     CustomerMismatchError,
     InvalidInvoiceStateError,
     InvoiceOverPaymentError,
@@ -19,15 +20,17 @@ from app.services.payment_allocation_service import (
 )
 from app.services.pricing_service import round_currency
 
+ALLOWED_METHODS = {"BANK_TRANSFER", "CHEQUE", "CASH", "MANUAL_OTHER"}
+
 
 class PaymentService:
     """Handles payment receipt, allocation against invoices, and account reconciliation."""
 
-    def _generate_payment_reference(self, db: Session) -> str:
+    def _generate_payment_number(self, db: Session) -> str:
         current_year = date.today().year
         count = (
             db.query(func.count(Payment.id))
-            .filter(Payment.payment_reference.like(f"PAY-{current_year}-%"))
+            .filter(Payment.payment_number.like(f"PAY-{current_year}-%"))
             .scalar()
             or 0
         )
@@ -43,7 +46,12 @@ class PaymentService:
         query = db.query(Payment).options(joinedload(Payment.allocations))
         if customer_id is not None:
             query = query.filter(Payment.customer_id == customer_id)
-        return query.order_by(Payment.payment_date.desc(), Payment.created_at.desc()).offset(skip).limit(limit).all()
+        return (
+            query.order_by(Payment.paid_at.desc(), Payment.created_at.desc())
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
 
     def get_payment(self, db: Session, payment_id: int) -> Payment:
         pay = (
@@ -61,43 +69,62 @@ class PaymentService:
 
     def create_payment(self, db: Session, payment_in: PaymentCreate) -> Payment:
         """Register a received payment, with optional immediate allocation to an invoice."""
-        ref = self._generate_payment_reference(db)
-        payment_date = payment_in.payment_date or date.today()
+        method = payment_in.payment_method.upper()
+        if method == "MANUAL":
+            method = "MANUAL_OTHER"
+        if method not in ALLOWED_METHODS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "payment_method must be one of BANK_TRANSFER, CHEQUE, CASH, or MANUAL_OTHER."
+                ),
+            )
+        paid_at = payment_in.paid_at or date.today()
 
         payment = Payment(
-            payment_reference=ref,
+            payment_number=self._generate_payment_number(db),
             customer_id=payment_in.customer_id,
             amount=payment_in.amount,
-            currency=payment_in.currency,
-            payment_method=payment_in.payment_method.upper(),
-            payment_date=payment_date,
-            status="COMPLETED",
+            currency=payment_in.currency.upper(),
+            payment_method=method,
+            paid_at=paid_at,
+            transaction_reference=payment_in.transaction_reference,
+            status="SUCCESS",
             amount_allocated=Decimal("0.00"),
-            unallocated_balance=payment_in.amount,
             notes=payment_in.notes,
         )
         db.add(payment)
         db.flush()
 
-        # If specific invoice provided, attempt allocation
         if payment_in.invoice_id:
             invoice = db.query(Invoice).filter(Invoice.id == payment_in.invoice_id).first()
-            if invoice:
-                alloc_amount = min(payment.unallocated_balance, invoice.balance_due)
-                if alloc_amount > Decimal("0.00"):
-                    self.allocate_payment(
-                        db=db,
-                        payment_id=payment.id,
-                        invoice_id=invoice.id,
-                        amount=alloc_amount,
-                    )
+            if not invoice:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Invoice with ID {payment_in.invoice_id} not found.",
+                )
+            unallocated = payment.amount - payment.amount_allocated
+            alloc_amount = min(unallocated, invoice.balance_due)
+            if alloc_amount > Decimal("0.00"):
+                self.allocate_payment(
+                    db=db,
+                    payment_id=payment.id,
+                    invoice_id=invoice.id,
+                    amount=alloc_amount,
+                    commit=False,
+                )
 
         db.commit()
         db.refresh(payment)
         return payment
 
     def allocate_payment(
-        self, db: Session, payment_id: int, invoice_id: int, amount: Decimal
+        self,
+        db: Session,
+        payment_id: int,
+        invoice_id: int,
+        amount: Decimal,
+        commit: bool = True,
     ) -> PaymentAllocation:
         """Allocate amount from payment unallocated balance to invoice."""
         payment = self.get_payment(db, payment_id)
@@ -109,68 +136,59 @@ class PaymentService:
             )
 
         try:
-            # 1. Customer boundary validation
-            payment_allocation_service.validate_customer_boundary(
+            payment_allocation_service.validate_allocation_eligibility(
+                payment_amount=payment.amount,
+                payment_allocated=payment.amount_allocated,
+                payment_status=payment.status,
+                invoice_total=invoice.total_amount,
+                invoice_paid=invoice.amount_paid,
+                invoice_status=invoice.status,
+                allocation_amount=amount,
                 payment_customer_id=payment.customer_id,
                 invoice_customer_id=invoice.customer_id,
-            )
-
-            # 2. Invoice eligibility validation
-            payment_allocation_service.validate_invoice_eligibility(
-                invoice_status=invoice.status,
-                invoice_balance_due=invoice.balance_due,
-            )
-
-            # 3. Allocation bounds validation
-            payment_allocation_service.validate_allocation_bounds(
-                requested_amount=amount,
-                unallocated_payment_balance=payment.unallocated_balance,
-                invoice_balance_due=invoice.balance_due,
             )
         except (
             CustomerMismatchError,
             InvalidInvoiceStateError,
             OverAllocationError,
             InvoiceOverPaymentError,
+            AllocationError,
         ) as err:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(err),
-            )
+            ) from err
 
-        # 4. Calculate new ledger balances
         new_paid, new_balance_due, new_allocated = payment_allocation_service.calculate_new_balances(
             current_invoice_total=invoice.total_amount,
             current_invoice_paid=invoice.amount_paid,
-            current_payment_amount=payment.amount,
             current_payment_allocated=payment.amount_allocated,
             allocation_amount=amount,
         )
 
-        # 5. Create allocation ledger entry
         allocation = PaymentAllocation(
             payment_id=payment.id,
             invoice_id=invoice.id,
             allocated_amount=amount,
-            allocation_date=datetime.now(UTC),
+            allocated_at=datetime.now(UTC),
         )
         db.add(allocation)
 
-        # 6. Update invoice state
         invoice.amount_paid = new_paid
         invoice.balance_due = new_balance_due
-        if new_balance_due == Decimal("0.00"):
-            invoice.status = "PAID"
-            invoice.paid_at = datetime.now(UTC)
-        elif new_paid > Decimal("0.00"):
-            invoice.status = "PARTIALLY_PAID"
+        invoice.status = payment_allocation_service.derive_invoice_status(
+            total_amount=invoice.total_amount,
+            amount_paid=new_paid,
+            is_overdue=invoice.due_date < date.today() and new_balance_due > Decimal("0.00"),
+        )
 
-        # 7. Update payment balance
         payment.amount_allocated = new_allocated
-        payment.unallocated_balance = round_currency(payment.amount - new_allocated)
 
-        db.commit()
-        db.refresh(allocation)
+        if commit:
+            db.commit()
+            db.refresh(allocation)
+        else:
+            db.flush()
         return allocation
 
 

@@ -1,6 +1,6 @@
 """Quotation domain service and atomic conversion to subscription."""
 
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import Decimal
 
 from fastapi import HTTPException, status
@@ -8,18 +8,18 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.models.plan import Plan
-from app.models.product import Product
+from app.models.product import Product, ProductVariant
 from app.models.quotation import Quotation, QuotationLine
 from app.models.subscription import Subscription, SubscriptionEvent, SubscriptionLine
 from app.models.tax import TaxRate
-from app.schemas.quotation import QuotationCreate, QuotationUpdate
+from app.schemas.quotation import QuotationCreate
 from app.services.billing_date_service import billing_date_service
 from app.services.discount_service import discount_service
 from app.services.pricing_service import calculate_line_totals, round_currency
 
 
 class QuotationService:
-    """Manages quotation drafts, calculations, confirmations, and conversion to active subscriptions."""
+    """Manages quotation drafts, calculations, confirmations, and conversion to subscriptions."""
 
     def _generate_quotation_number(self, db: Session) -> str:
         current_year = date.today().year
@@ -72,107 +72,172 @@ class QuotationService:
 
     def create_quotation(self, db: Session, quote_in: QuotationCreate) -> Quotation:
         """Create a quotation, evaluating lines, tax rates, and optional discounts."""
-        quote_number = self._generate_quotation_number(db)
+        issue_date = quote_in.issue_date or date.today()
+        if quote_in.expiration_date < issue_date:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Expiration date must be on or after the issue date.",
+            )
 
         lines_to_add: list[dict] = []
         raw_lines = quote_in.lines
 
-        # If lines not explicitly supplied but plan_id given, pre-fill from plan items
         if not raw_lines and quote_in.plan_id:
-            plan = db.query(Plan).options(joinedload(Plan.items)).filter(Plan.id == quote_in.plan_id).first()
-            if plan and plan.items:
-                for item in plan.items:
-                    prod = db.query(Product).filter(Product.id == item.product_id).first()
-                    lines_to_add.append({
+            plan = (
+                db.query(Plan)
+                .options(joinedload(Plan.items))
+                .filter(Plan.id == quote_in.plan_id)
+                .first()
+            )
+            if not plan:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Plan with ID {quote_in.plan_id} not found.",
+                )
+            if not plan.items:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="The selected plan has no items to quote.",
+                )
+            for item in plan.items:
+                prod = db.query(Product).filter(Product.id == item.product_id).first()
+                lines_to_add.append(
+                    {
                         "product_id": item.product_id,
-                        "variant_id": item.variant_id,
-                        "description": prod.name if prod else "Subscription Line Item",
+                        "product_variant_id": item.product_variant_id,
+                        "plan_id": plan.id,
+                        "description": prod.name if prod else "Subscription line item",
                         "quantity": item.quantity,
                         "unit_price": item.unit_price,
-                        "tax_rate_id": prod.tax_rate_id if prod else quote_in.tax_rate_id,
-                    })
+                        "discount_rate": Decimal("0.00"),
+                        "tax_rate_id": quote_in.tax_rate_id,
+                    }
+                )
 
         for line_in in raw_lines:
             prod = db.query(Product).filter(Product.id == line_in.product_id).first()
-            desc = line_in.description or (prod.name if prod else "Product Line")
-            tax_id = line_in.tax_rate_id or (prod.tax_rate_id if prod else quote_in.tax_rate_id)
-            lines_to_add.append({
-                "product_id": line_in.product_id,
-                "variant_id": line_in.variant_id,
-                "description": desc,
-                "quantity": line_in.quantity,
-                "unit_price": line_in.unit_price,
-                "tax_rate_id": tax_id,
-            })
+            if not prod:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Product with ID {line_in.product_id} not found.",
+                )
+            desc = line_in.description or prod.name
+            if line_in.product_variant_id:
+                variant = (
+                    db.query(ProductVariant)
+                    .filter(ProductVariant.id == line_in.product_variant_id)
+                    .first()
+                )
+                if variant:
+                    desc = f"{desc} — {variant.variant_name}: {variant.variant_value}"
+            lines_to_add.append(
+                {
+                    "product_id": line_in.product_id,
+                    "product_variant_id": line_in.product_variant_id,
+                    "plan_id": line_in.plan_id or quote_in.plan_id,
+                    "description": desc,
+                    "quantity": line_in.quantity,
+                    "unit_price": line_in.unit_price,
+                    "discount_rate": line_in.discount_rate,
+                    "tax_rate_id": line_in.tax_rate_id or quote_in.tax_rate_id,
+                }
+            )
+
+        if not lines_to_add:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A quotation requires at least one line item or a plan with items.",
+            )
 
         quotation = Quotation(
-            quotation_number=quote_number,
+            quotation_number=self._generate_quotation_number(db),
             customer_id=quote_in.customer_id,
-            plan_id=quote_in.plan_id,
+            template_id=quote_in.template_id,
             status="DRAFT",
-            valid_until=quote_in.valid_until,
-            currency=quote_in.currency,
-            terms_conditions=quote_in.terms_conditions,
+            issue_date=issue_date,
+            expiration_date=quote_in.expiration_date,
+            currency=quote_in.currency.upper(),
             notes=quote_in.notes,
+            is_converted=False,
         )
         db.add(quotation)
         db.flush()
 
-        # Compute line totals
         total_subtotal = Decimal("0.00")
         total_tax = Decimal("0.00")
+        total_line_discount = Decimal("0.00")
 
         for line_data in lines_to_add:
             tax_rate_percent = Decimal("0.00")
             if line_data["tax_rate_id"]:
                 tax_obj = db.query(TaxRate).filter(TaxRate.id == line_data["tax_rate_id"]).first()
                 if tax_obj:
-                    tax_rate_percent = tax_obj.rate_percent
+                    tax_rate_percent = tax_obj.rate_percentage
 
+            raw_subtotal = round_currency(
+                Decimal(line_data["quantity"]) * Decimal(str(line_data["unit_price"]))
+            )
+            line_discount = round_currency(
+                raw_subtotal * (Decimal(str(line_data["discount_rate"])) / Decimal("100.00"))
+            )
             computed = calculate_line_totals(
                 quantity=line_data["quantity"],
                 unit_price=line_data["unit_price"],
-                discount_amount=Decimal("0.00"),
+                discount_amount=line_discount,
                 tax_rate_percent=tax_rate_percent,
             )
 
             q_line = QuotationLine(
                 quotation_id=quotation.id,
                 product_id=line_data["product_id"],
-                variant_id=line_data["variant_id"],
-                description=line_data["description"],
+                product_variant_id=line_data["product_variant_id"],
+                plan_id=line_data["plan_id"],
+                description_snapshot=line_data["description"],
                 quantity=line_data["quantity"],
-                unit_price=line_data["unit_price"],
-                discount_amount=computed["discount_amount"],
-                subtotal=computed["subtotal"],
+                unit_price_snapshot=line_data["unit_price"],
+                discount_rate=line_data["discount_rate"],
                 tax_rate_id=line_data["tax_rate_id"],
-                tax_amount=computed["tax_amount"],
-                total_amount=computed["total_amount"],
+                tax_rate_snapshot=tax_rate_percent,
+                line_subtotal=computed["subtotal"],
+                line_tax=computed["tax_amount"],
+                line_total=computed["total_amount"],
             )
             db.add(q_line)
             total_subtotal += computed["subtotal"]
             total_tax += computed["tax_amount"]
+            total_line_discount += computed["discount_amount"]
 
-        # Discount code check
-        quote_discount_amount = Decimal("0.00")
+        quote_discount_amount = total_line_discount
         if quote_in.discount_code:
             v_res = discount_service.validate_code(db, quote_in.discount_code, total_subtotal)
-            if v_res.valid:
-                quote_discount_amount = v_res.calculated_discount_amount
+            if not v_res.valid:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=v_res.message,
+                )
+            quote_discount_amount = round_currency(
+                quote_discount_amount + v_res.calculated_discount_amount
+            )
 
         quotation.subtotal = total_subtotal
         quotation.discount_amount = quote_discount_amount
         quotation.tax_amount = total_tax
         quotation.total_amount = round_currency(total_subtotal - quote_discount_amount + total_tax)
+        if quotation.total_amount < Decimal("0.00"):
+            quotation.total_amount = Decimal("0.00")
 
         db.commit()
-        db.refresh(quotation)
-        return quotation
+        return self.get_quotation(db, quotation.id)
 
     def confirm_quotation(self, db: Session, quotation_id: int) -> Quotation:
         """Mark quotation as CONFIRMED."""
         quote = self.get_quotation(db, quotation_id)
-        if quote.status in ["CANCELLED", "REJECTED", "EXPIRED", "CONVERTED"]:
+        if quote.is_converted:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot confirm a quotation that has already been converted.",
+            )
+        if quote.status in ["CANCELLED", "EXPIRED"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Cannot confirm quotation in state '{quote.status}'.",
@@ -183,18 +248,19 @@ class QuotationService:
         return quote
 
     def convert_to_subscription(self, db: Session, quotation_id: int) -> Subscription:
-        """
-        Atomically converts a confirmed quotation into an active subscription.
-        Copies lines with lineage references, initializes billing dates and anchor.
-        """
+        """Atomically convert a confirmed quotation into an active subscription."""
         quote = self.get_quotation(db, quotation_id)
-        if quote.status == "CONVERTED":
+        if quote.is_converted:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Quotation {quote.quotation_number} has already been converted to subscription ID {quote.converted_subscription_id}.",
+                detail=f"Quotation {quote.quotation_number} has already been converted.",
+            )
+        if quote.status in ["CANCELLED", "EXPIRED"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Cannot convert quotation in state '{quote.status}'.",
             )
         if quote.status != "CONFIRMED":
-            # Auto-confirm if still in draft/sent
             quote.status = "CONFIRMED"
 
         if not quote.lines:
@@ -203,81 +269,76 @@ class QuotationService:
                 detail="Cannot convert a quotation with zero line items to a subscription.",
             )
 
-        # Plan billing parameters
-        billing_interval = "MONTHLY"
-        interval_count = 1
-        trial_days = 0
-        if quote.plan_id:
-            plan = db.query(Plan).filter(Plan.id == quote.plan_id).first()
-            if plan:
-                billing_interval = plan.billing_interval
-                interval_count = plan.interval_count
-                trial_days = plan.trial_period_days
+        plan_id = next((line.plan_id for line in quote.lines if line.plan_id), None)
+        if not plan_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Quotation must reference a subscription plan on at least one line.",
+            )
+        plan = db.query(Plan).filter(Plan.id == plan_id).first()
+        if not plan:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The plan referenced by this quotation no longer exists.",
+            )
 
+        billing_interval = plan.billing_interval
+        interval_count = plan.interval_count
         start_date = date.today()
         anchor_day = start_date.day
-        anchor_month = start_date.month if billing_interval == "YEARLY" else None
-
-        p_start, p_end = billing_date_service.compute_billing_period(
-            start_date=start_date,
-            interval=billing_interval,
+        _p_start, p_end = billing_date_service.compute_billing_period(
+            period_start=start_date,
+            interval=billing_interval,  # type: ignore[arg-type]
             interval_count=interval_count,
             anchor_day=anchor_day,
-            anchor_month=anchor_month,
         )
 
-        sub_number = self._generate_subscription_number(db)
+        recurring = round_currency(
+            sum((line.line_subtotal for line in quote.lines), Decimal("0.00"))
+        )
+
         subscription = Subscription(
-            subscription_number=sub_number,
+            subscription_number=self._generate_subscription_number(db),
             customer_id=quote.customer_id,
-            plan_id=quote.plan_id or 1,
+            plan_id=plan.id,
+            originating_quotation_id=quote.id,
             status="ACTIVE",
-            billing_interval=billing_interval,
-            interval_count=interval_count,
-            billing_anchor_day=anchor_day,
-            billing_anchor_month=anchor_month,
             start_date=start_date,
-            current_period_start=p_start,
-            current_period_end=p_end,
+            end_date=None,
+            billing_anchor_day=anchor_day,
             next_billing_date=p_end,
-            trial_end_date=None,
+            payment_terms_days=15,
             currency=quote.currency,
-            total_recurring_amount=quote.total_amount,
+            recurring_amount=recurring,
         )
         db.add(subscription)
         db.flush()
 
-        # Copy quotation lines to subscription lines
         for q_line in quote.lines:
             sub_line = SubscriptionLine(
                 subscription_id=subscription.id,
                 product_id=q_line.product_id,
-                variant_id=q_line.variant_id,
+                product_variant_id=q_line.product_variant_id,
                 quotation_line_id=q_line.id,
-                description=q_line.description,
+                description_snapshot=q_line.description_snapshot,
                 quantity=q_line.quantity,
-                unit_price=q_line.unit_price,
-                discount_amount=q_line.discount_amount,
-                subtotal=q_line.subtotal,
+                unit_price_snapshot=q_line.unit_price_snapshot,
                 tax_rate_id=q_line.tax_rate_id,
-                tax_amount=q_line.tax_amount,
-                total_amount=q_line.total_amount,
+                tax_rate_snapshot=q_line.tax_rate_snapshot,
             )
             db.add(sub_line)
 
-        # Audit lifecycle event
         event = SubscriptionEvent(
             subscription_id=subscription.id,
             event_type="CREATED",
             from_status=None,
             to_status="ACTIVE",
-            description=f"Subscription created via quotation conversion ({quote.quotation_number}).",
+            reason=f"Subscription created from quotation {quote.quotation_number}.",
         )
         db.add(event)
 
-        # Update quotation status and lineage pointer
-        quote.converted_subscription_id = subscription.id
-        quote.status = "CONVERTED"
+        quote.is_converted = True
+        quote.status = "CONFIRMED"
 
         db.commit()
         db.refresh(subscription)

@@ -32,8 +32,8 @@ class BillingPreviewResponse(BaseModel):
 class BillingRunRequest(BaseModel):
     """Payload to trigger a recurring billing execution."""
 
-    run_date: date | None = None  # Defaults to today
-    auto_post: bool = True  # Automatically mark invoices as ISSUED
+    run_date: date | None = None
+    auto_post: bool = True
 
 
 class BillingRunResponse(BaseModel):

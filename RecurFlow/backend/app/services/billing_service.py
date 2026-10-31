@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.models.customer import Customer
 from app.models.invoice import Invoice, InvoiceLine
+from app.models.plan import Plan
 from app.models.subscription import Subscription, SubscriptionEvent
 from app.schemas.billing import (
     BillingPreviewItem,
@@ -31,6 +32,30 @@ class BillingService:
         )
         return f"INV-{current_year}-{count + 1:05d}"
 
+    def _period_for(self, sub: Subscription, plan: Plan) -> tuple[date, date]:
+        period_end = sub.next_billing_date
+        period_start, computed_end = billing_date_service.compute_billing_period(
+            period_start=sub.start_date,
+            interval=plan.billing_interval,  # type: ignore[arg-type]
+            interval_count=plan.interval_count,
+            anchor_day=sub.billing_anchor_day,
+        )
+        # Walk forward from start until the window that ends on next_billing_date.
+        cursor = period_start
+        window_end = computed_end
+        guard = 0
+        while window_end < period_end and guard < 240:
+            cursor = window_end
+            window_end = billing_date_service.calculate_next_billing_date(
+                current_date=cursor,
+                interval=plan.billing_interval,  # type: ignore[arg-type]
+                interval_count=plan.interval_count,
+                anchor_day=sub.billing_anchor_day,
+                anchor_month=sub.start_date.month,
+            )
+            guard += 1
+        return cursor, period_end
+
     def preview_due_subscriptions(
         self, db: Session, run_date: date | None = None
     ) -> BillingPreviewResponse:
@@ -39,7 +64,7 @@ class BillingService:
 
         due_subs = (
             db.query(Subscription)
-            .options(joinedload(Subscription.lines))
+            .options(joinedload(Subscription.lines), joinedload(Subscription.plan))
             .filter(
                 Subscription.status == "ACTIVE",
                 Subscription.next_billing_date <= target_date,
@@ -51,9 +76,13 @@ class BillingService:
         total_revenue = Decimal("0.00")
 
         for sub in due_subs:
+            plan = sub.plan or db.query(Plan).filter(Plan.id == sub.plan_id).first()
+            if not plan:
+                continue
             cust = db.query(Customer).filter(Customer.id == sub.customer_id).first()
             cust_name = cust.company_name if cust else "Unknown Customer"
-            est_amount = sub.total_recurring_amount
+            p_start, p_end = self._period_for(sub, plan)
+            est_amount = sub.recurring_amount
 
             preview_items.append(
                 BillingPreviewItem(
@@ -61,9 +90,9 @@ class BillingService:
                     subscription_number=sub.subscription_number,
                     customer_id=sub.customer_id,
                     customer_name=cust_name,
-                    billing_interval=sub.billing_interval,
-                    period_start=sub.current_period_start,
-                    period_end=sub.current_period_end,
+                    billing_interval=plan.billing_interval,
+                    period_start=p_start,
+                    period_end=p_end,
                     estimated_amount=est_amount,
                     currency=sub.currency,
                 )
@@ -81,14 +110,14 @@ class BillingService:
         self, db: Session, run_date: date | None = None, auto_post: bool = True
     ) -> BillingRunResponse:
         """
-        Executes recurring billing cycle for all active subscriptions due on or before run_date.
-        Enforces idempotency: never generates duplicate invoices for same subscription and period.
+        Execute recurring billing for active subscriptions due on or before run_date.
+        Idempotent: never generates duplicate invoices for the same subscription and period.
         """
         target_date = run_date or date.today()
 
         due_subs = (
             db.query(Subscription)
-            .options(joinedload(Subscription.lines))
+            .options(joinedload(Subscription.lines), joinedload(Subscription.plan))
             .filter(
                 Subscription.status == "ACTIVE",
                 Subscription.next_billing_date <= target_date,
@@ -102,10 +131,13 @@ class BillingService:
         generated_ids: list[int] = []
 
         for sub in due_subs:
-            p_start = sub.current_period_start
-            p_end = sub.current_period_end
+            plan = sub.plan or db.query(Plan).filter(Plan.id == sub.plan_id).first()
+            if not plan:
+                invoices_skipped += 1
+                continue
 
-            # Idempotency check: does an invoice already exist for this (subscription_id, period_start, period_end)?
+            p_start, p_end = self._period_for(sub, plan)
+
             existing_invoice = (
                 db.query(Invoice)
                 .filter(
@@ -115,86 +147,109 @@ class BillingService:
                 )
                 .first()
             )
-
             if existing_invoice:
-                # Idempotent skip: prevent duplicate billing
                 invoices_skipped += 1
                 continue
 
             cust = db.query(Customer).filter(Customer.id == sub.customer_id).first()
-            payment_terms = cust.payment_terms_days if cust else 30
+            payment_terms = sub.payment_terms_days if sub.payment_terms_days else 15
             due_date = target_date + timedelta(days=payment_terms)
+            if due_date < target_date:
+                due_date = target_date
 
-            inv_number = self._generate_invoice_number(db)
-            invoice_status = "ISSUED" if auto_post else "DRAFT"
-
+            invoice_status = "CONFIRMED" if auto_post else "DRAFT"
             invoice = Invoice(
-                invoice_number=inv_number,
+                invoice_number=self._generate_invoice_number(db),
                 customer_id=sub.customer_id,
                 subscription_id=sub.id,
                 status=invoice_status,
                 currency=sub.currency,
                 billing_period_start=p_start,
                 billing_period_end=p_end,
-                invoice_date=target_date,
+                issue_date=target_date,
                 due_date=due_date,
                 notes=f"Recurring billing for {sub.subscription_number} ({p_start} to {p_end})",
             )
             db.add(invoice)
             db.flush()
 
-            # Copy line items
             sub_total = Decimal("0.00")
             sub_discount = Decimal("0.00")
             sub_tax = Decimal("0.00")
 
-            for s_line in sub.lines:
-                inv_line = InvoiceLine(
-                    invoice_id=invoice.id,
-                    product_id=s_line.product_id,
-                    variant_id=s_line.variant_id,
-                    subscription_line_id=s_line.id,
-                    description=s_line.description,
-                    quantity=s_line.quantity,
-                    unit_price=s_line.unit_price,
-                    discount_amount=s_line.discount_amount,
-                    subtotal=s_line.subtotal,
-                    tax_rate_id=s_line.tax_rate_id,
-                    tax_amount=s_line.tax_amount,
-                    total_amount=s_line.total_amount,
+            lines = list(sub.lines)
+            if not lines:
+                computed = calculate_line_totals(
+                    quantity=1,
+                    unit_price=sub.recurring_amount,
+                    discount_amount=Decimal("0.00"),
+                    tax_rate_percent=Decimal("0.00"),
                 )
-                db.add(inv_line)
-                sub_total += s_line.subtotal
-                sub_discount += s_line.discount_amount
-                sub_tax += s_line.tax_amount
+                db.add(
+                    InvoiceLine(
+                        invoice_id=invoice.id,
+                        subscription_line_id=None,
+                        description_snapshot=f"{plan.name} recurring charge",
+                        quantity=1,
+                        unit_price_snapshot=sub.recurring_amount,
+                        discount_amount=Decimal("0.00"),
+                        tax_rate_snapshot=Decimal("0.00"),
+                        line_subtotal=computed["subtotal"],
+                        line_tax=computed["tax_amount"],
+                        line_total=computed["total_amount"],
+                    )
+                )
+                sub_total = computed["subtotal"]
+                sub_tax = computed["tax_amount"]
+            else:
+                for s_line in lines:
+                    computed = calculate_line_totals(
+                        quantity=s_line.quantity,
+                        unit_price=s_line.unit_price_snapshot,
+                        discount_amount=Decimal("0.00"),
+                        tax_rate_percent=s_line.tax_rate_snapshot or Decimal("0.00"),
+                    )
+                    db.add(
+                        InvoiceLine(
+                            invoice_id=invoice.id,
+                            subscription_line_id=s_line.id,
+                            description_snapshot=s_line.description_snapshot,
+                            quantity=s_line.quantity,
+                            unit_price_snapshot=s_line.unit_price_snapshot,
+                            discount_amount=computed["discount_amount"],
+                            tax_rate_snapshot=s_line.tax_rate_snapshot,
+                            line_subtotal=computed["subtotal"],
+                            line_tax=computed["tax_amount"],
+                            line_total=computed["total_amount"],
+                        )
+                    )
+                    sub_total += computed["subtotal"]
+                    sub_discount += computed["discount_amount"]
+                    sub_tax += computed["tax_amount"]
 
+            line_sum = round_currency(sub_total - sub_discount + sub_tax)
             invoice.subtotal = round_currency(sub_total)
             invoice.discount_amount = round_currency(sub_discount)
             invoice.tax_amount = round_currency(sub_tax)
-            line_sum = round_currency(sub_total - sub_discount + sub_tax)
             invoice.total_amount = line_sum
             invoice.amount_paid = Decimal("0.00")
             invoice.balance_due = line_sum
 
-            # Advance subscription to next period using billing_date_service
             next_date = billing_date_service.calculate_next_billing_date(
                 current_date=p_end,
-                interval=sub.billing_interval,
-                interval_count=sub.interval_count,
+                interval=plan.billing_interval,  # type: ignore[arg-type]
+                interval_count=plan.interval_count,
                 anchor_day=sub.billing_anchor_day,
-                anchor_month=sub.billing_anchor_month,
+                anchor_month=sub.start_date.month,
             )
-            sub.current_period_start = p_end
-            sub.current_period_end = next_date
             sub.next_billing_date = next_date
 
-            # Log subscription billed event
             event = SubscriptionEvent(
                 subscription_id=sub.id,
                 event_type="BILLED",
                 from_status=sub.status,
                 to_status=sub.status,
-                description=f"Generated invoice {inv_number} for period {p_start} to {p_end}.",
+                reason=f"Generated invoice {invoice.invoice_number} for period {p_start} to {p_end}.",
             )
             db.add(event)
 

@@ -44,7 +44,12 @@ class Settings(BaseSettings):
 
     # CORS Origins
     CORS_ORIGINS: list[str] | str = Field(
-        default=["http://localhost:5173", "http://127.0.0.1:5173"],
+        default=[
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
         description="List of permitted CORS origins or comma-separated string.",
     )
 

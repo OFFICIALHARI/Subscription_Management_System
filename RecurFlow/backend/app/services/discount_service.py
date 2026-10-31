@@ -7,12 +7,12 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.models.discount import Discount
-from app.schemas.discount import DiscountCreate, DiscountUpdate, DiscountValidationResponse
+from app.schemas.discount import DiscountCreate, DiscountValidationResponse
 from app.services.pricing_service import round_currency
 
 
 class DiscountService:
-    """Manages promotional discounts, coupons, and cart discount calculations."""
+    """Manages promotional discounts, coupons, and discount calculations."""
 
     def list_discounts(self, db: Session, is_active: bool | None = None) -> list[Discount]:
         query = db.query(Discount)
@@ -39,16 +39,18 @@ class DiscountService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Discount code '{discount_in.code}' already exists.",
             )
+        start = discount_in.start_date or date.today()
         discount = Discount(
             code=discount_in.code.upper(),
             name=discount_in.name,
             discount_type=discount_in.discount_type.upper(),
             discount_value=discount_in.discount_value,
-            currency=discount_in.currency,
             min_order_amount=discount_in.min_order_amount,
             max_uses_total=discount_in.max_uses_total,
-            starts_at=discount_in.starts_at,
-            ends_at=discount_in.ends_at,
+            uses_count=0,
+            max_uses_per_customer=discount_in.max_uses_per_customer,
+            start_date=start,
+            end_date=discount_in.end_date,
             is_active=discount_in.is_active,
         )
         db.add(discount)
@@ -73,12 +75,12 @@ class DiscountService:
             )
 
         today = date.today()
-        if discount.starts_at and today < discount.starts_at:
+        if discount.start_date and today < discount.start_date:
             return DiscountValidationResponse(
                 valid=False,
                 message=f"Discount code '{code}' is not active yet.",
             )
-        if discount.ends_at and today > discount.ends_at:
+        if discount.end_date and today > discount.end_date:
             return DiscountValidationResponse(
                 valid=False,
                 message=f"Discount code '{code}' has expired.",
@@ -93,10 +95,12 @@ class DiscountService:
         if order_amount < discount.min_order_amount:
             return DiscountValidationResponse(
                 valid=False,
-                message=f"Order amount ${order_amount} is below minimum requirement of ${discount.min_order_amount}.",
+                message=(
+                    f"Order amount {order_amount} is below the minimum of "
+                    f"{discount.min_order_amount}."
+                ),
             )
 
-        # Compute calculated discount
         if discount.discount_type == "PERCENTAGE":
             calc = round_currency(order_amount * (discount.discount_value / Decimal("100.00")))
         else:

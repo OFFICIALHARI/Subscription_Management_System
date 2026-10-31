@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.models.customer import Customer
 from app.models.invoice import Invoice
 from app.models.payment import Payment, PaymentAllocation
+from app.models.plan import Plan
 from app.models.subscription import Subscription
 from app.schemas.dashboard import DashboardKPIsResponse, MonthlyRevenueItem, RevenueTrendResponse
 from app.services.pricing_service import round_currency
@@ -21,7 +22,6 @@ class DashboardService:
         """Compute real-time KPI metrics."""
         today = date.today()
 
-        # 1. Active Subscriptions and MRR calculation
         active_subs = (
             db.query(Subscription)
             .filter(Subscription.status == "ACTIVE")
@@ -30,9 +30,10 @@ class DashboardService:
 
         mrr_total = Decimal("0.00")
         for sub in active_subs:
-            amount = sub.total_recurring_amount
-            interval = sub.billing_interval.upper()
-            count = max(sub.interval_count, 1)
+            amount = sub.recurring_amount
+            plan = db.query(Plan).filter(Plan.id == sub.plan_id).first()
+            interval = (plan.billing_interval if plan else "MONTHLY").upper()
+            count = max(plan.interval_count if plan else 1, 1)
 
             if interval == "DAILY":
                 monthly_val = (amount * Decimal("30.00")) / Decimal(count)
@@ -50,7 +51,6 @@ class DashboardService:
         mrr = round_currency(mrr_total)
         arr = round_currency(mrr * Decimal("12.00"))
 
-        # 2. Subscription counts
         active_sub_count = len(active_subs)
         paused_sub_count = (
             db.query(func.count(Subscription.id))
@@ -59,15 +59,13 @@ class DashboardService:
             or 0
         )
 
-        # 3. Customer count
         total_customers = (
             db.query(func.count(Customer.id))
-            .filter(Customer.is_active == True)  # noqa: E712
+            .filter(Customer.is_active.is_(True))
             .scalar()
             or 0
         )
 
-        # 4. Invoiced and Receivables
         invoiced_sum = (
             db.query(func.coalesce(func.sum(Invoice.total_amount), Decimal("0.00")))
             .filter(Invoice.status != "CANCELLED")
@@ -77,7 +75,7 @@ class DashboardService:
 
         receivables_sum = (
             db.query(func.coalesce(func.sum(Invoice.balance_due), Decimal("0.00")))
-            .filter(Invoice.status.in_(["ISSUED", "PARTIALLY_PAID", "OVERDUE"]))
+            .filter(Invoice.status.in_(["CONFIRMED", "DRAFT", "PARTIALLY_PAID", "OVERDUE"]))
             .scalar()
         )
         outstanding_receivables = round_currency(Decimal(str(receivables_sum)))
@@ -93,18 +91,19 @@ class DashboardService:
         )
         overdue_amount = round_currency(Decimal(str(overdue_sum)))
 
-        # 5. Collected payments (sum of allocations)
-        collected_sum = (
-            db.query(func.coalesce(func.sum(PaymentAllocation.allocated_amount), Decimal("0.00")))
-            .filter(PaymentAllocation.reversed_at.is_(None))
-            .scalar()
-        )
+        collected_sum = db.query(
+            func.coalesce(func.sum(PaymentAllocation.allocated_amount), Decimal("0.00"))
+        ).scalar()
         total_collected = round_currency(Decimal(str(collected_sum)))
 
-        # 6. Unallocated cash
         unallocated_sum = (
-            db.query(func.coalesce(func.sum(Payment.unallocated_balance), Decimal("0.00")))
-            .filter(Payment.status == "COMPLETED")
+            db.query(
+                func.coalesce(
+                    func.sum(Payment.amount - Payment.amount_allocated),
+                    Decimal("0.00"),
+                )
+            )
+            .filter(Payment.status == "SUCCESS")
             .scalar()
         )
         unallocated_cash = round_currency(Decimal(str(unallocated_sum)))
@@ -124,10 +123,9 @@ class DashboardService:
 
     def get_revenue_trend(self, db: Session) -> RevenueTrendResponse:
         """Monthly historical aggregated trend of invoiced vs collected revenue."""
-        # Query monthly invoiced
         invoiced_rows = (
             db.query(
-                func.to_char(Invoice.invoice_date, "YYYY-MM").label("month"),
+                func.to_char(Invoice.issue_date, "YYYY-MM").label("month"),
                 func.sum(Invoice.total_amount).label("invoiced"),
             )
             .filter(Invoice.status != "CANCELLED")
@@ -138,13 +136,11 @@ class DashboardService:
 
         invoiced_map = {row.month: Decimal(str(row.invoiced)) for row in invoiced_rows}
 
-        # Query monthly collected
         collected_rows = (
             db.query(
-                func.to_char(PaymentAllocation.allocation_date, "YYYY-MM").label("month"),
+                func.to_char(PaymentAllocation.allocated_at, "YYYY-MM").label("month"),
                 func.sum(PaymentAllocation.allocated_amount).label("collected"),
             )
-            .filter(PaymentAllocation.reversed_at.is_(None))
             .group_by("month")
             .order_by("month")
             .all()
@@ -155,12 +151,12 @@ class DashboardService:
         all_months = sorted(set(list(invoiced_map.keys()) + list(collected_map.keys())))
         trend: list[MonthlyRevenueItem] = []
 
-        for m in all_months:
+        for month in all_months:
             trend.append(
                 MonthlyRevenueItem(
-                    month=m,
-                    invoiced_amount=round_currency(invoiced_map.get(m, Decimal("0.00"))),
-                    collected_amount=round_currency(collected_map.get(m, Decimal("0.00"))),
+                    month=month,
+                    invoiced_amount=round_currency(invoiced_map.get(month, Decimal("0.00"))),
+                    collected_amount=round_currency(collected_map.get(month, Decimal("0.00"))),
                 )
             )
 

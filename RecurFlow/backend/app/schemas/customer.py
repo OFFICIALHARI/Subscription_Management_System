@@ -1,26 +1,24 @@
-"""Customer Pydantic v2 schemas."""
+"""Customer Pydantic v2 schemas aligned with the customers ORM model."""
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class CustomerBase(BaseModel):
-    """Base customer fields."""
+    """Base customer fields matching the customers table."""
 
-    company_name: str
-    contact_name: str
+    company_name: str = Field(..., min_length=1, max_length=255)
+    contact_name: str = Field(..., min_length=1, max_length=255)
     email: EmailStr
     phone: str | None = None
     tax_identifier: str | None = None
-    billing_address_line1: str
+    billing_address_line1: str = Field(..., min_length=1, max_length=255)
     billing_address_line2: str | None = None
-    city: str
-    state: str
-    postal_code: str
-    country: str = "US"
-    currency: str = "USD"
-    payment_terms_days: int = 30
+    billing_city: str = Field(..., min_length=1, max_length=100)
+    billing_state: str = Field(..., min_length=1, max_length=100)
+    billing_postal_code: str = Field(..., min_length=1, max_length=30)
+    billing_country: str = "India"
 
 
 class CustomerCreate(CustomerBase):
@@ -39,12 +37,10 @@ class CustomerUpdate(BaseModel):
     tax_identifier: str | None = None
     billing_address_line1: str | None = None
     billing_address_line2: str | None = None
-    city: str | None = None
-    state: str | None = None
-    postal_code: str | None = None
-    country: str | None = None
-    currency: str | None = None
-    payment_terms_days: int | None = None
+    billing_city: str | None = None
+    billing_state: str | None = None
+    billing_postal_code: str | None = None
+    billing_country: str | None = None
     is_active: bool | None = None
 
 
@@ -61,7 +57,7 @@ class CustomerResponse(CustomerBase):
 
 
 class CustomerDetailResponse(CustomerResponse):
-    """Customer detailed response including counts or related summary."""
+    """Customer detailed response including related summary metrics."""
 
     active_subscriptions_count: int = 0
     total_invoiced_amount: float = 0.0
