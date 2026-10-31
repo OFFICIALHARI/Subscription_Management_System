@@ -151,6 +151,7 @@ erDiagram
         bigint customer_id FK
         bigint plan_id FK
         bigint originating_quotation_id FK
+        bigint renewed_from_subscription_id FK
         varchar status
         date start_date
         date end_date
@@ -159,6 +160,8 @@ erDiagram
         integer payment_terms_days
         varchar currency
         numeric recurring_amount
+        timestamp paused_at
+        timestamp resumed_at
         varchar auto_close_reason
         timestamp created_at
         timestamp updated_at
@@ -169,6 +172,7 @@ erDiagram
         bigint subscription_id FK
         bigint product_id FK
         bigint product_variant_id FK
+        bigint quotation_line_id FK
         varchar description_snapshot
         integer quantity
         numeric unit_price_snapshot
@@ -259,6 +263,7 @@ erDiagram
         bigint customer_id FK
         varchar payment_method
         numeric amount
+        numeric amount_allocated
         varchar currency
         date paid_at
         varchar transaction_reference
@@ -306,7 +311,9 @@ erDiagram
     quotation_templates ||--o{ quotations : "templates"
     quotations ||--|{ quotation_lines : "contains"
     quotations ||--o| subscriptions : "converts into"
+    quotation_lines ||--o{ subscription_lines : "lineage for"
 
+    subscriptions ||--o| subscriptions : "renewed from"
     subscriptions ||--|{ subscription_lines : "defines"
     subscriptions ||--o{ subscription_events : "transitions through"
     subscriptions ||--o{ invoices : "recurringly generates"

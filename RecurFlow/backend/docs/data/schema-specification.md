@@ -2,7 +2,9 @@
 
 **System:** RecurFlow (Subscription Operations & Revenue Management)  
 **Author:** Data Architect Specialist Agent  
-**Review Gate:** Gate 2 Review Submission  
+**Specification Version:** 1.1.0 (Refined after Gate 1 Review)  
+**Database Engine:** PostgreSQL 17  
+**ORM Target:** SQLAlchemy 2.x  
 **Reference Document:** `agent.md` (Sections 5, 7, 8, 13)
 
 ---
@@ -10,11 +12,11 @@
 ## 1. Architectural Foundations & Global Invariants
 
 ### 1.1 Technology Selection & Precision Standards
-- **Target Engine:** PostgreSQL 16+
+- **Target Engine:** PostgreSQL 17 (Official Docker container `recurflow-db` on host port `5434`)
 - **Dialect & Driver:** SQLAlchemy 2 with `psycopg` (v3 binary)
-- **Monetary Representation:** Every monetary amount (prices, subtotals, discounts, tax amounts, line totals, balances) must strictly use `NUMERIC(12, 2)`. Floating point types (`REAL`, `DOUBLE PRECISION`, `FLOAT`) are forbidden across all tables.
-- **Quantity Representation:** Quantities use `NUMERIC(10, 2)` or `INTEGER >= 1` depending on fractional entitlement support. In RecurFlow, standard unit quantities use `INTEGER CHECK (quantity > 0)`.
-- **Temporal Handling:** All timestamps (`created_at`, `updated_at`, `event_time`, `paid_at`) are stored as `TIMESTAMP WITH TIME ZONE` strictly in `UTC`. Dates without time components (`start_date`, `end_date`, `issue_date`, `due_date`, `next_billing_date`) use `DATE`.
+- **Monetary Representation:** Every monetary amount (prices, adjustments, subtotals, discounts, tax amounts, line totals, balances, allocated amounts) strictly uses `NUMERIC(12, 2)`. Floating point types (`REAL`, `DOUBLE PRECISION`, `FLOAT`) are forbidden across all tables.
+- **Quantity Representation:** Quantities use `INTEGER CHECK (quantity > 0)`.
+- **Temporal Handling:** All timestamps (`created_at`, `updated_at`, `paused_at`, `resumed_at`, `allocated_at`) are stored as `TIMESTAMP WITH TIME ZONE` strictly in `UTC`. Dates without time components (`start_date`, `end_date`, `issue_date`, `due_date`, `next_billing_date`, `paid_at`) use `DATE`.
 
 ### 1.2 Identifier Strategy
 - **Internal Primary Keys:** Every table uses a surrogate primary key `id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY` for optimal B-Tree index locality, join performance, and foreign key storage.
@@ -25,14 +27,16 @@
   - Payment Reference: `PAY-YYYY-XXXXX` (e.g., `PAY-2026-00001`)
 
 ### 1.3 Auditability & Immutability Architecture
-- **Financial Line Item Snapshots:** Quotation and Invoice lines must be completely immutable once issued. They store snapshot copies of product name, variant description, unit price, and applied tax rate. When catalog prices or tax rules change later, historical quotations, subscriptions, and invoices remain intact.
+- **Financial Line Item Snapshots:** Quotation and Invoice lines must be completely immutable once issued. They store snapshot copies of product name, variant description, unit price (base + variant adjustment), and applied tax rate. When catalog prices or tax rules change later, historical quotations, subscriptions, and invoices remain intact.
+- **Line-Level Lineage:** To guarantee end-to-end commercial auditability:
+  $$\text{Quotation Line} \xrightarrow{\text{quotation\_line\_id}} \text{Subscription Line} \xrightarrow{\text{subscription\_line\_id}} \text{Invoice Line}$$
 - **Deletion Prevention (Soft Delete / Archive):** Master records (`customers`, `products`, `plans`, `discounts`, `tax_rates`) must never be hard-deleted if referenced in quotes, subscriptions, or invoices. Foreign keys enforce `ON DELETE RESTRICT`. Soft deletion is achieved via `is_active BOOLEAN DEFAULT TRUE` and `archived_at TIMESTAMP WITH TIME ZONE NULL`.
 - **Audit Trails:** Critical state changes in quotes, subscriptions, invoices, and payments emit immutable records into `audit_logs` and `subscription_events`.
 
 ### 1.4 Recurring Billing Idempotency
 To eliminate duplicate invoice generation, a PostgreSQL composite unique constraint is enforced:
 $$\text{UNIQUE}(\text{subscription\_id}, \text{billing\_period\_start}, \text{billing\_period\_end})$$
-Repeated executions of the billing cycle runner within the same period are safely rejected or skipped by the engine.
+Repeated executions of the billing cycle runner within the same period are safely rejected by the database engine.
 
 ---
 
@@ -131,7 +135,7 @@ CREATE INDEX ix_products_is_active ON products (is_active);
 ```
 
 #### Table: `product_variants`
-Product options and adjustments (e.g., Enterprise Tier, Extra Seat, High Bandwidth).
+Product options and price adjustments (e.g., Enterprise Edition with +560.00 price adjustment).
 ```sql
 CREATE TABLE product_variants (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -139,7 +143,7 @@ CREATE TABLE product_variants (
     variant_name VARCHAR(100) NOT NULL, -- e.g. "Edition", "Seats Tier"
     variant_value VARCHAR(100) NOT NULL, -- e.g. "Enterprise", "50 Users"
     sku_suffix VARCHAR(50) NULL,
-    price_adjustment NUMERIC(12, 2) NOT NULL DEFAULT 0.00, -- added to base product sales price
+    price_adjustment NUMERIC(12, 2) NOT NULL DEFAULT 0.00, -- configurable delta (e.g. +560.00)
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
@@ -168,7 +172,7 @@ CREATE INDEX ix_tax_rates_is_active ON tax_rates (is_active);
 ```
 
 #### Table: `plans`
-Recurring billing plans and lifecycle frequencies.
+Recurring billing plans across all frequencies (Daily, Weekly, Monthly, Yearly).
 ```sql
 CREATE TABLE plans (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -274,7 +278,7 @@ CREATE TABLE quotation_lines (
     plan_id BIGINT NULL,
     description_snapshot VARCHAR(500) NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 1,
-    unit_price_snapshot NUMERIC(12, 2) NOT NULL,
+    unit_price_snapshot NUMERIC(12, 2) NOT NULL, -- frozen base price + variant adjustment
     discount_rate NUMERIC(5, 2) NOT NULL DEFAULT 0.00, -- percentage discount on line
     tax_rate_id BIGINT NULL,
     tax_rate_snapshot NUMERIC(5, 2) NOT NULL DEFAULT 0.00, -- e.g. 18.00%
@@ -295,10 +299,10 @@ CREATE INDEX ix_quotation_lines_quotation_id ON quotation_lines (quotation_id);
 
 ---
 
-### 2.4 Subscriptions & Lifecycle
+### 2.4 Subscriptions & Lifecycle Engine
 
 #### Table: `subscriptions`
-Active recurring contractual commitments.
+Active recurring contractual commitments with renewal and pause tracking.
 ```sql
 CREATE TABLE subscriptions (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -306,14 +310,18 @@ CREATE TABLE subscriptions (
     customer_id BIGINT NOT NULL,
     plan_id BIGINT NOT NULL,
     originating_quotation_id BIGINT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'DRAFT', -- 'DRAFT', 'ACTIVE', 'PAUSED', 'CLOSED'
+    renewed_from_subscription_id BIGINT NULL, -- self-referential lineage for renewals
+    status VARCHAR(20) NOT NULL DEFAULT 'DRAFT', 
+    -- Lifecycle: DRAFT -> QUOTATION -> CONFIRMED -> ACTIVE -> CLOSED, with PAUSED
     start_date DATE NOT NULL,
     end_date DATE NULL, -- NULL implies perpetual auto-renewing contract
-    billing_anchor_day INTEGER NOT NULL, -- 1 to 31
+    billing_anchor_day INTEGER NOT NULL, -- 1 to 31 (preserves anchor across Feb / month-ends)
     next_billing_date DATE NOT NULL,
     payment_terms_days INTEGER NOT NULL DEFAULT 15, -- Net 15 days
     currency VARCHAR(3) NOT NULL DEFAULT 'USD',
     recurring_amount NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+    paused_at TIMESTAMP WITH TIME ZONE NULL,
+    resumed_at TIMESTAMP WITH TIME ZONE NULL,
     auto_close_reason VARCHAR(255) NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
@@ -321,7 +329,8 @@ CREATE TABLE subscriptions (
     CONSTRAINT fk_subscriptions_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE RESTRICT,
     CONSTRAINT fk_subscriptions_plan FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE RESTRICT,
     CONSTRAINT fk_subscriptions_quotation FOREIGN KEY (originating_quotation_id) REFERENCES quotations(id) ON DELETE SET NULL,
-    CONSTRAINT ck_subscriptions_status CHECK (status IN ('DRAFT', 'ACTIVE', 'PAUSED', 'CLOSED')),
+    CONSTRAINT fk_subscriptions_renewed_from FOREIGN KEY (renewed_from_subscription_id) REFERENCES subscriptions(id) ON DELETE SET NULL,
+    CONSTRAINT ck_subscriptions_status CHECK (status IN ('DRAFT', 'QUOTATION', 'CONFIRMED', 'ACTIVE', 'PAUSED', 'CLOSED')),
     CONSTRAINT ck_subscriptions_anchor CHECK (billing_anchor_day BETWEEN 1 AND 31),
     CONSTRAINT ck_subscriptions_dates CHECK (end_date IS NULL OR end_date >= start_date),
     CONSTRAINT ck_subscriptions_recurring CHECK (recurring_amount >= 0)
@@ -330,19 +339,21 @@ CREATE INDEX ix_subscriptions_customer_id ON subscriptions (customer_id);
 CREATE INDEX ix_subscriptions_plan_id ON subscriptions (plan_id);
 CREATE INDEX ix_subscriptions_status_billing_date ON subscriptions (status, next_billing_date);
 CREATE INDEX ix_subscriptions_originating_quote ON subscriptions (originating_quotation_id);
+CREATE INDEX ix_subscriptions_renewed_from ON subscriptions (renewed_from_subscription_id);
 ```
 
 #### Table: `subscription_lines`
-Recurring product items attached to the subscription.
+Recurring product items attached to the subscription with line-level lineage.
 ```sql
 CREATE TABLE subscription_lines (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     subscription_id BIGINT NOT NULL,
     product_id BIGINT NOT NULL,
     product_variant_id BIGINT NULL,
+    quotation_line_id BIGINT NULL, -- lineage back to originating quotation line
     description_snapshot VARCHAR(500) NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 1,
-    unit_price_snapshot NUMERIC(12, 2) NOT NULL,
+    unit_price_snapshot NUMERIC(12, 2) NOT NULL, -- frozen price at conversion/activation
     tax_rate_id BIGINT NULL,
     tax_rate_snapshot NUMERIC(5, 2) NOT NULL DEFAULT 0.00,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'),
@@ -350,15 +361,17 @@ CREATE TABLE subscription_lines (
     CONSTRAINT fk_subscription_lines_sub FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE,
     CONSTRAINT fk_subscription_lines_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
     CONSTRAINT fk_subscription_lines_variant FOREIGN KEY (product_variant_id) REFERENCES product_variants(id) ON DELETE RESTRICT,
+    CONSTRAINT fk_subscription_lines_quote_line FOREIGN KEY (quotation_line_id) REFERENCES quotation_lines(id) ON DELETE SET NULL,
     CONSTRAINT fk_subscription_lines_tax FOREIGN KEY (tax_rate_id) REFERENCES tax_rates(id) ON DELETE SET NULL,
     CONSTRAINT ck_sub_lines_quantity CHECK (quantity >= 1),
     CONSTRAINT ck_sub_lines_price CHECK (unit_price_snapshot >= 0)
 );
 CREATE INDEX ix_subscription_lines_sub_id ON subscription_lines (subscription_id);
+CREATE INDEX ix_subscription_lines_quote_line ON subscription_lines (quotation_line_id);
 ```
 
 #### Table: `subscription_events`
-Dedicated lifecycle transition timeline for subscriptions.
+Audit history of state transitions for subscriptions.
 ```sql
 CREATE TABLE subscription_events (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -505,7 +518,7 @@ CREATE INDEX ix_invoice_lines_invoice_id ON invoice_lines (invoice_id);
 ```
 
 #### Table: `payments`
-Recorded customer payment receipts.
+Recorded customer payment receipts with strict over-allocation defense-in-depth.
 ```sql
 CREATE TABLE payments (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -513,6 +526,7 @@ CREATE TABLE payments (
     customer_id BIGINT NOT NULL,
     payment_method VARCHAR(50) NOT NULL, -- 'BANK_TRANSFER', 'CHEQUE', 'CASH', 'MANUAL_OTHER'
     amount NUMERIC(12, 2) NOT NULL,
+    amount_allocated NUMERIC(12, 2) NOT NULL DEFAULT 0.00, -- tracked for over-allocation defense
     currency VARCHAR(3) NOT NULL DEFAULT 'USD',
     paid_at DATE NOT NULL,
     transaction_reference VARCHAR(100) NULL, -- UTR / Cheque No / Bank Ref
@@ -523,6 +537,7 @@ CREATE TABLE payments (
     CONSTRAINT uq_payments_number UNIQUE (payment_number),
     CONSTRAINT fk_payments_customer FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE RESTRICT,
     CONSTRAINT ck_payments_amount CHECK (amount > 0),
+    CONSTRAINT ck_payments_allocated CHECK (amount_allocated >= 0 AND amount_allocated <= amount),
     CONSTRAINT ck_payments_status CHECK (status IN ('SUCCESS', 'CANCELLED')),
     CONSTRAINT ck_payments_method CHECK (payment_method IN ('BANK_TRANSFER', 'CHEQUE', 'CASH', 'MANUAL_OTHER'))
 );
@@ -567,7 +582,7 @@ $$\text{Total Amount} = \text{Subtotal} - \text{Total Discount} + \text{Total Ta
 
 ### 3.2 Payment Allocation & Status Reconciliation Invariants
 For any payment $p$:
-$$\sum_{\text{allocations}} \text{allocated\_amount} \le p.\text{amount}$$
+$$p.\text{amount\_allocated} = \sum_{\text{allocations}} \text{allocated\_amount} \le p.\text{amount}$$
 
 For any invoice $i$:
 $$i.\text{amount\_paid} = \sum_{\text{allocations}} \text{allocated\_amount}$$

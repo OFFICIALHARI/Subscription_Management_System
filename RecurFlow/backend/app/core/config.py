@@ -25,9 +25,9 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
 
-    # Database Configuration (PostgreSQL)
+    # Database Configuration (PostgreSQL 17 on dedicated port 5434)
     DATABASE_URL: str = Field(
-        default="postgresql+psycopg://recurflow:change_me@localhost:5432/recurflow",
+        default="postgresql+psycopg://recurflow:change_me@localhost:5434/recurflow",
         description="Database connection string formatted for SQLAlchemy 2 with psycopg driver.",
     )
     DB_POOL_SIZE: int = 10

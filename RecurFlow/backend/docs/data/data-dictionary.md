@@ -2,14 +2,15 @@
 
 **System:** RecurFlow (Subscription Operations & Revenue Management)  
 **Author:** Data Architect Specialist Agent  
-**Review Gate:** Gate 2 Review Submission  
+**Specification Version:** 1.1.0 (Refined after Gate 1 Review)  
+**Engine:** PostgreSQL 17  
 **Reference Document:** `agent.md` (Sections 5, 7, 8)
 
 ---
 
 ## 1. Overview & Conventions
 
-- **Data Types:** Conforms strictly to PostgreSQL 16+ native standard types (`BIGINT`, `VARCHAR`, `NUMERIC`, `INTEGER`, `DATE`, `TIMESTAMP WITH TIME ZONE`, `BOOLEAN`, `JSONB`).
+- **Data Types:** Conforms strictly to PostgreSQL 17 native standard types (`BIGINT`, `VARCHAR`, `NUMERIC`, `INTEGER`, `DATE`, `TIMESTAMP WITH TIME ZONE`, `BOOLEAN`, `JSONB`).
 - **Monetary Precision:** All currency columns use `NUMERIC(12, 2)` representing decimal currency (two decimal places, maximum \$9,999,999,999.99).
 - **Percentages:** Tax and discount percentages use `NUMERIC(5, 2)` (e.g., `18.00` represents 18.00%).
 - **Timezone:** All timestamps store UTC instants (`TIMESTAMP WITH TIME ZONE`).
@@ -92,7 +93,7 @@ Base commercial offerings, recurring services, and software licenses.
 ---
 
 ### 2.5 Table: `product_variants`
-Specific configurable options modifying base products.
+Specific configurable options modifying base products (e.g. +560.00 price adjustment).
 
 | Column | Data Type | Nullable | Keys / Constraints | Default | Business Definition & Validation Rules |
 |---|---|---|---|---|---|
@@ -101,7 +102,7 @@ Specific configurable options modifying base products.
 | `variant_name` | `VARCHAR(100)`| No | Compound UK | None | Name of the variation dimension (e.g., "Tier", "Bandwidth"). |
 | `variant_value` | `VARCHAR(100)`| No | Compound UK | None | Specific choice (e.g., "Enterprise", "100GB"). |
 | `sku_suffix` | `VARCHAR(50)` | Yes | None | `NULL` | Suffix appended to parent SKU. |
-| `price_adjustment`| `NUMERIC(12, 2)`| No| None | `0.00` | Price delta added to parent `products.sales_price`. |
+| `price_adjustment`| `NUMERIC(12, 2)`| No| None | `0.00` | Configurable price delta added to parent `products.sales_price`. |
 | `is_active` | `BOOLEAN` | No | None | `TRUE` | Active flag for this variant option. |
 | `created_at` | `TIMESTAMPTZ` | No | None | `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` | UTC creation timestamp. |
 | `updated_at` | `TIMESTAMPTZ` | No | None | `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` | UTC update timestamp. |
@@ -125,7 +126,7 @@ Tax jurisdiction rates and classification.
 ---
 
 ### 2.7 Table: `plans`
-Recurring billing cadences and commitment structures.
+Recurring billing cadences and commitment structures across all 4 frequencies.
 
 | Column | Data Type | Nullable | Keys / Constraints | Default | Business Definition & Validation Rules |
 |---|---|---|---|---|---|
@@ -198,7 +199,7 @@ Customer proposal and quotation documents.
 ---
 
 ### 2.11 Table: `quotation_lines`
-Individual line item breakdown on a quotation.
+Individual line item breakdown on a quotation with frozen snapshots.
 
 | Column | Data Type | Nullable | Keys / Constraints | Default | Business Definition & Validation Rules |
 |---|---|---|---|---|---|
@@ -209,7 +210,7 @@ Individual line item breakdown on a quotation.
 | `plan_id` | `BIGINT` | Yes | FK -> `plans(id)` `ON DELETE RESTRICT` | `NULL` | Associated plan if line represents recurring item. |
 | `description_snapshot`| `VARCHAR(500)`| No| None | None | Immutable snapshot of product and variant text. |
 | `quantity` | `INTEGER` | No | `CHECK (quantity >= 1)` | `1` | Quoted units. |
-| `unit_price_snapshot`| `NUMERIC(12, 2)`| No| `CHECK (unit_price_snapshot >= 0)` | None | Frozen unit price at quote generation. |
+| `unit_price_snapshot`| `NUMERIC(12, 2)`| No| `CHECK (unit_price_snapshot >= 0)` | None | Frozen unit price (base + variant adjustment). |
 | `discount_rate` | `NUMERIC(5, 2)` | No | `CHECK (discount_rate BETWEEN 0 AND 100)` | `0.00` | Percentage discount on line. |
 | `tax_rate_id` | `BIGINT` | Yes | FK -> `tax_rates(id)` `ON DELETE SET NULL` | `NULL` | Tax rule reference. |
 | `tax_rate_snapshot`| `NUMERIC(5, 2)`| No| None | `0.00` | Frozen tax percentage at quote generation. |
@@ -221,7 +222,7 @@ Individual line item breakdown on a quotation.
 ---
 
 ### 2.12 Table: `subscriptions`
-Contractual recurring subscription commitments.
+Contractual recurring subscription commitments with renewal and pause tracking.
 
 | Column | Data Type | Nullable | Keys / Constraints | Default | Business Definition & Validation Rules |
 |---|---|---|---|---|---|
@@ -230,14 +231,17 @@ Contractual recurring subscription commitments.
 | `customer_id` | `BIGINT` | No | FK -> `customers(id)` `ON DELETE RESTRICT`| None | Account holder. |
 | `plan_id` | `BIGINT` | No | FK -> `plans(id)` `ON DELETE RESTRICT` | None | Governing billing plan. |
 | `originating_quotation_id`| `BIGINT`| Yes| FK -> `quotations(id)` `ON DELETE SET NULL`| `NULL`| Upstream accepted quotation that generated this subscription. |
-| `status` | `VARCHAR(20)` | No | Index, `CHECK IN ('DRAFT', 'ACTIVE', 'PAUSED', 'CLOSED')` | `'DRAFT'` | Subscription lifecycle state. Only ACTIVE triggers billing. |
+| `renewed_from_subscription_id`| `BIGINT`| Yes| FK -> `subscriptions(id)` `ON DELETE SET NULL`, Index | `NULL` | Parent subscription in renewal lineage chain. |
+| `status` | `VARCHAR(20)` | No | Index, `CHECK IN ('DRAFT', 'QUOTATION', 'CONFIRMED', 'ACTIVE', 'PAUSED', 'CLOSED')` | `'DRAFT'` | Subscription lifecycle state. Only ACTIVE triggers billing. |
 | `start_date` | `DATE` | No | None | None | Date contract begins. |
 | `end_date` | `DATE` | Yes | `CHECK (end_date IS NULL OR end_date >= start_date)` | `NULL` | Cancellation or expiration date (NULL if perpetual auto-renewing). |
-| `billing_anchor_day`| `INTEGER` | No | `CHECK (billing_anchor_day BETWEEN 1 AND 31)` | None | Fixed day of month for recurring billing (e.g., 15th). |
+| `billing_anchor_day`| `INTEGER` | No | `CHECK (billing_anchor_day BETWEEN 1 AND 31)` | None | Fixed day of month for recurring billing (e.g., 15th, 31st). |
 | `next_billing_date` | `DATE` | No | Index | None | Due date evaluated by billing cycle runner. |
 | `payment_terms_days`| `INTEGER` | No | `CHECK (payment_terms_days >= 0)` | `15` | Days added to invoice issue date to compute `due_date`. |
 | `currency` | `VARCHAR(3)` | No | None | `'USD'` | Currency code. |
 | `recurring_amount` | `NUMERIC(12, 2)`| No| `CHECK (recurring_amount >= 0)` | `0.00` | Normalized recurring contract value per billing cycle. |
+| `paused_at` | `TIMESTAMPTZ` | Yes | None | `NULL` | UTC timestamp when subscription was paused. |
+| `resumed_at` | `TIMESTAMPTZ` | Yes | None | `NULL` | UTC timestamp when subscription was resumed from pause. |
 | `auto_close_reason` | `VARCHAR(255)`| Yes| None | `NULL` | Reason text when subscription is terminated/closed. |
 | `created_at` | `TIMESTAMPTZ` | No | None | `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` | UTC creation timestamp. |
 | `updated_at` | `TIMESTAMPTZ` | No | None | `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` | UTC update timestamp. |
@@ -253,9 +257,10 @@ Contracted lines copied to invoice lines upon recurring billing execution.
 | `subscription_id`| `BIGINT` | No | FK -> `subscriptions(id)` `ON DELETE CASCADE`| None | Parent subscription. |
 | `product_id` | `BIGINT` | No | FK -> `products(id)` `ON DELETE RESTRICT`| None | Catalog product. |
 | `product_variant_id`| `BIGINT`| Yes| FK -> `product_variants(id)` `ON DELETE RESTRICT`| `NULL`| Variant option. |
+| `quotation_line_id`| `BIGINT` | Yes| FK -> `quotation_lines(id)` `ON DELETE SET NULL`, Index | `NULL` | Lineage link to originating quotation line item. |
 | `description_snapshot`| `VARCHAR(500)`| No| None | None | Frozen descriptive text for billing invoices. |
 | `quantity` | `INTEGER` | No | `CHECK (quantity >= 1)` | `1` | Recurring contracted quantity. |
-| `unit_price_snapshot`| `NUMERIC(12, 2)`| No| `CHECK (unit_price_snapshot >= 0)` | None | Frozen contract price per unit. |
+| `unit_price_snapshot`| `NUMERIC(12, 2)`| No| `CHECK (unit_price_snapshot >= 0)` | None | Frozen contract price per unit (base + variant adjustment). |
 | `tax_rate_id` | `BIGINT` | Yes | FK -> `tax_rates(id)` `ON DELETE SET NULL` | `NULL` | Applicable tax rule. |
 | `tax_rate_snapshot`| `NUMERIC(5, 2)`| No| None | `0.00` | Frozen tax percentage. |
 | `created_at` | `TIMESTAMPTZ` | No | None | `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` | UTC creation timestamp. |
@@ -316,7 +321,7 @@ Transactional audit log connecting applied discounts to generated invoices.
 ---
 
 ### 2.17 Table: `invoices`
-Authoritative commercial billing invoices.
+Authoritative commercial billing invoices with duplicate period prevention.
 
 | Column | Data Type | Nullable | Keys / Constraints | Default | Business Definition & Validation Rules |
 |---|---|---|---|---|---|
@@ -356,7 +361,7 @@ Individual itemized charges on an invoice.
 | `subscription_line_id`| `BIGINT`| Yes| FK -> `subscription_lines(id)` `ON DELETE SET NULL`| `NULL`| Upstream subscription line item reference. |
 | `description_snapshot`| `VARCHAR(500)`| No| None | None | Frozen descriptive snapshot. |
 | `quantity` | `INTEGER` | No | `CHECK (quantity >= 1)` | `1` | Units billed. |
-| `unit_price_snapshot`| `NUMERIC(12, 2)`| No| `CHECK (unit_price_snapshot >= 0)` | None | Frozen unit price. |
+| `unit_price_snapshot`| `NUMERIC(12, 2)`| No| `CHECK (unit_price_snapshot >= 0)` | None | Frozen unit price (base + variant adjustment). |
 | `discount_amount`| `NUMERIC(12, 2)`| No| `CHECK (discount_amount >= 0)` | `0.00` | Line-level discount deducted. |
 | `tax_rate_snapshot`| `NUMERIC(5, 2)`| No| None | `0.00` | Frozen tax percentage rate. |
 | `line_subtotal` | `NUMERIC(12, 2)`| No| None | None | Pre-tax line subtotal. |
@@ -367,7 +372,7 @@ Individual itemized charges on an invoice.
 ---
 
 ### 2.19 Table: `payments`
-Customer payments received and recorded.
+Customer payments received and recorded with over-allocation defense-in-depth.
 
 | Column | Data Type | Nullable | Keys / Constraints | Default | Business Definition & Validation Rules |
 |---|---|---|---|---|---|
@@ -376,6 +381,7 @@ Customer payments received and recorded.
 | `customer_id` | `BIGINT` | No | FK -> `customers(id)` `ON DELETE RESTRICT`| None | Remitting customer. |
 | `payment_method`| `VARCHAR(50)`| No | `CHECK IN ('BANK_TRANSFER', 'CHEQUE', 'CASH', 'MANUAL_OTHER')` | None | Instrument or channel. No card numbers stored. |
 | `amount` | `NUMERIC(12, 2)`| No| `CHECK (amount > 0)` | None | Total funds received in this payment. |
+| `amount_allocated`| `NUMERIC(12, 2)`| No| `CHECK (amount_allocated >= 0 AND amount_allocated <= amount)` | `0.00` | Cumulative amount allocated across invoices. |
 | `currency` | `VARCHAR(3)` | No | None | `'USD'` | Currency code. |
 | `paid_at` | `DATE` | No | Index | None | Calendar date funds were cleared / received. |
 | `transaction_reference`| `VARCHAR(100)`| Yes| None | `NULL` | Bank reference, UTR, or cheque clearance code. |
